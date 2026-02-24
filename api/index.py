@@ -97,18 +97,67 @@ def detect_box():
                 valid_candidates.append(smallest_container)
             else:
                 # If OpenCV contours completely missed the border (due to semi-transparent UI blending into snow)
-                # We use a robust heuristic fallback anchor crop around the desc_box!
-                # It covers typical item tooltips comfortably without grabbing the entire screen.
-                heuristic_x = max(0, desc_box["x"] - 140)
-                heuristic_y = max(0, desc_box["y"] - 340)
-                heuristic_w = 420
-                heuristic_h = 480
-                heuristic_x = min(heuristic_x, img_w - heuristic_w)
-                heuristic_y = min(heuristic_y, img_h - heuristic_h)
+                # Fallback: Extract the exact text bounds using color masking in the tooltip region!
+                hsv_img = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
                 
-                valid_candidates.append({
-                    "x": heuristic_x, "y": heuristic_y, "w": heuristic_w, "h": heuristic_h, "area": heuristic_w*heuristic_h
-                })
+                # Target cyan/blue stats
+                def hex_to_hsv(hex_color):
+                    hex_color = hex_color.lstrip('#')
+                    bgr = tuple(int(hex_color[i:i+2], 16) for i in (4, 2, 0))
+                    return cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)[0][0]
+                
+                target_hsv_cyan = hex_to_hsv('7c98c1')
+                lower_cyan = np.array([max(0, target_hsv_cyan[0] - 15), max(0, target_hsv_cyan[1] - 50), max(0, target_hsv_cyan[2] - 50)])
+                upper_cyan = np.array([min(179, target_hsv_cyan[0] + 15), min(255, target_hsv_cyan[1] + 50), min(255, target_hsv_cyan[2] + 50)])
+                mask_cyan = cv2.inRange(hsv_img, lower_cyan, upper_cyan)
+                
+                # Target white tooltip text
+                lower_white = np.array([0, 0, 150])
+                upper_white = np.array([179, 60, 255])
+                mask_white = cv2.inRange(hsv_img, lower_white, upper_white)
+                
+                combined_mask = cv2.bitwise_or(mask_cyan, mask_white)
+                
+                # Restrict search around desc_box
+                search_x = max(0, desc_box["x"] - 50)
+                search_y = max(0, desc_box["y"] - 450)
+                search_w = 400
+                search_h = 450 + desc_box["h"] + 20
+                
+                roi_mask = np.zeros(hsv_img.shape[:2], dtype=np.uint8)
+                cv2.rectangle(roi_mask, (search_x, search_y), (search_x+search_w, search_y+search_h), 255, -1)
+                
+                masked_combined = cv2.bitwise_and(combined_mask, combined_mask, mask=roi_mask)
+                
+                kernel = np.ones((80, 200), np.uint8) 
+                closed_mask = cv2.morphologyEx(masked_combined, cv2.MORPH_CLOSE, kernel)
+                
+                text_contours, _ = cv2.findContours(closed_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                
+                best_text_block = None
+                max_text_area = 0
+                for cnt in text_contours:
+                    tx, ty, tw, th = cv2.boundingRect(cnt)
+                    if tw*th > max_text_area:
+                        max_text_area = tw*th
+                        best_text_block = {"x": tx, "y": ty, "w": tw, "h": th}
+                        
+                if best_text_block:
+                    pad = 20
+                    heuristic_x = max(0, best_text_block["x"] - pad)
+                    heuristic_y = max(0, best_text_block["y"] - pad)
+                    heuristic_w = best_text_block["w"] + 2*pad
+                    heuristic_h = best_text_block["h"] + 2*pad
+                    
+                    # Ensure it doesn't exceed image bounds
+                    heuristic_x = min(heuristic_x, img_w - 1)
+                    heuristic_y = min(heuristic_y, img_h - 1)
+                    heuristic_w = min(heuristic_w, img_w - heuristic_x)
+                    heuristic_h = min(heuristic_h, img_h - heuristic_y)
+                    
+                    valid_candidates.append({
+                        "x": heuristic_x, "y": heuristic_y, "w": heuristic_w, "h": heuristic_h, "area": heuristic_w*heuristic_h
+                    })
         
         if not valid_candidates:
             # Complete fallback to the old logic if description text wasn't found at all
