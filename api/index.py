@@ -1,198 +1,236 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from pathlib import Path
+
 import cv2
 import numpy as np
-import os
+from flask import Flask, jsonify, request
+from flask_cors import CORS
 
 app = Flask(__name__)
-# Enable CORS for the React Dev Server
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-def hex_to_hsv(hex_color):
-    """Converts a hex color string to an OpenCV HSV numpy array."""
-    hex_color = hex_color.lstrip('#')
-    bgr = tuple(int(hex_color[i:i+2], 16) for i in (4, 2, 0))
-    hsv = cv2.cvtColor(np.uint8([[bgr]]), cv2.COLOR_BGR2HSV)[0][0]
-    return hsv
+TEMPLATE_SIZE = 20
+TEMPLATE_THRESHOLD = 0.55
+TOP_K_CANDIDATES = 80
 
-@app.route('/detect-box', methods=['POST'])
-@app.route('/api/detect-box', methods=['POST'])
-def detect_box():
-    if 'image' not in request.files:
-        return jsonify({"error": "No image uploaded"}), 400
-        
-    file = request.files['image']
-    
-    # Read image directly from memory into OpenCV format
-    file_bytes = np.frombuffer(file.read(), np.uint8)
-    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    
-    if img is None:
-        return jsonify({"error": "Invalid image format"}), 400
-        
-    try:
-        hsv_img = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        img_h, img_w = img.shape[:2]
-        
-        # 1. Target the specific Cyan/Blue text used for item stats (e.g. #7c98c1, #8dacda, #7f9bc4)
-        target_hsv_cyan = hex_to_hsv('7c98c1')
-        
-        # Provide a generous range around the center color to catch slight variations
-        lower_cyan = np.array([max(0, target_hsv_cyan[0] - 15), max(0, target_hsv_cyan[1] - 50), max(0, target_hsv_cyan[2] - 50)])
-        upper_cyan = np.array([min(179, target_hsv_cyan[0] + 15), min(255, target_hsv_cyan[1] + 50), min(255, target_hsv_cyan[2] + 50)])
-        mask_cyan = cv2.inRange(hsv_img, lower_cyan, upper_cyan)
-        
-        # 2. Cluster the cyan text to rigidly locate the item stats block anywhere on the screen
-        # Huge morphological closing to connect all cyan stat lines into one massive block
-        kernel_cyan = np.ones((50, 100), np.uint8)
-        cyan_closed = cv2.morphologyEx(mask_cyan, cv2.MORPH_CLOSE, kernel_cyan)
-        
-        cyan_contours, _ = cv2.findContours(cyan_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        best_stats_block = None
-        max_stats_area = 0
-        
-        # Find the massive stats block (ignoring tiny noise)
-        for cnt in cyan_contours:
-            x, y, w, h = cv2.boundingRect(cnt)
-            area = w * h
-            if area > 2000 and area > max_stats_area:
-                max_stats_area = area
-                best_stats_block = {"x": x, "y": y, "w": w, "h": h}
-                
-        valid_candidates = []
-        
-        if best_stats_block:
-            # 3. We found the stats block! Now we define a Region of Interest (ROI) column
-            # The tooltip contains Title (top), Stats (middle), Description (bottom)
-            # They all fall roughly within the same vertical column.
-            
-            roi_x = max(0, best_stats_block["x"] - 50) # Small horizontal padding
-            roi_w = min(img_w - roi_x, best_stats_block["w"] + 100)
-            
-            # The title is above the stats, description is below.
-            # We search a large vertical section surrounding the stats block.
-            roi_y = max(0, best_stats_block["y"] - 300)
-            roi_h = min(img_h - roi_y, best_stats_block["h"] + 600)
-            
-            roi_mask = np.zeros(hsv_img.shape[:2], dtype=np.uint8)
-            cv2.rectangle(roi_mask, (roi_x, roi_y), (roi_x+roi_w, roi_y+roi_h), 255, -1)
-            
-            # 4. Target bright white text (used for titles and descriptions)
-            lower_white = np.array([0, 0, 150])
-            upper_white = np.array([179, 60, 255])
-            mask_white = cv2.inRange(hsv_img, lower_white, upper_white)
-            
-            # Combine Cyan AND White text masks
-            combined_text_mask = cv2.bitwise_or(mask_cyan, mask_white)
-            
-            # Only consider text WITHIN our stats column ROI
-            masked_combined = cv2.bitwise_and(combined_text_mask, combined_text_mask, mask=roi_mask)
-            
-            # 5. Cluster all related text within the tooltip container into a final bounding box
-            kernel_all_text = np.ones((100, 200), np.uint8) 
-            final_closed = cv2.morphologyEx(masked_combined, cv2.MORPH_CLOSE, kernel_all_text)
-            
-            final_contours, _ = cv2.findContours(final_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            best_full_tooltip = None
-            max_full_area = 0
-            
-            for cnt in final_contours:
-                x, y, w, h = cv2.boundingRect(cnt)
-                area = w * h
-                if area > max_full_area:
-                    max_full_area = area
-                    best_full_tooltip = {"x": x, "y": y, "w": w, "h": h}
-                    
-            if best_full_tooltip:
-                # Add a comfortable padding around the text block to form the UI crop
-                pad = 25
-                crop_x = max(0, best_full_tooltip["x"] - pad)
-                crop_y = max(0, best_full_tooltip["y"] - pad)
-                crop_w = best_full_tooltip["w"] + 2*pad
-                crop_h = best_full_tooltip["h"] + 2*pad
-                
-                # Clamp to image bounds
-                crop_x = min(crop_x, img_w - 1)
-                crop_y = min(crop_y, img_h - 1)
-                crop_w = min(crop_w, img_w - crop_x)
-                crop_h = min(crop_h, img_h - crop_y)
-                
-                valid_candidates.append({
-                    "x": crop_x, "y": crop_y, "w": crop_w, "h": crop_h, "area": crop_w * crop_h
-                })
-                
-        # 6. Absolute Fallback: Original Edge Detection Logic
-        # If the cyan text is completely missing from the image for some reason, try drawing a box around large edges.
-        if not valid_candidates:
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            edges = cv2.Canny(blurred, 50, 150)
-            
-            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            for cnt in contours:
-                epsilon = 0.02 * cv2.arcLength(cnt, True)
-                approx = cv2.approxPolyDP(cnt, epsilon, True)
-                
-                if len(approx) >= 4:
-                    x, y, w, h = cv2.boundingRect(approx)
-                    area = int(w * h)
-                    
-                    max_allowed_area = int(float(img_h) * float(img_w) * 0.8)
-                    if 50000 < area < max_allowed_area:
-                        valid_candidates.append({"x": x, "y": y, "w": w, "h": h, "area": area})
-                        
-            # Filter out containers
-            filtered_candidates = []
-            def contains(rect1, rect2):
-                return (rect1["x"] <= rect2["x"] and 
-                        rect1["y"] <= rect2["y"] and 
-                        rect1["x"] + rect1["w"] >= rect2["x"] + rect2["w"] and 
-                        rect1["y"] + rect1["h"] >= rect2["y"] + rect2["h"])
-                        
-            for c1 in valid_candidates:
-                is_container = False
-                for c2 in valid_candidates:
-                    if c1 != c2 and contains(c1, c2):
-                        is_container = True
-                        break
-                if not is_container:
-                    filtered_candidates.append(c1)
-                    
-            valid_candidates = filtered_candidates
-                
-        best_rect = None
-        max_valid_area = 0
-        
-        for c in valid_candidates:
-            if c["area"] > max_valid_area:
-                max_valid_area = c["area"]
-                # Calculate percentages to prevent ReactCrop shifting on responsive screens
-                best_rect = {
-                    "unit": "%",
-                    "x": (float(c["x"]) / float(img_w)) * 100.0,
-                    "y": (float(c["y"]) / float(img_h)) * 100.0,
-                    "width": (float(c["w"]) / float(img_w)) * 100.0,
-                    "height": (float(c["h"]) / float(img_h)) * 100.0
-                }
-        
-        if best_rect:
-            return jsonify({
-                "success": True,
-                "box": best_rect,
-                "message": f"AI detected showcase box via text clustering"
-            })
+
+def _load_templates():
+    base_dir = Path(__file__).resolve().parent
+    tl_path = base_dir / "template_tl.png"
+    br_path = base_dir / "template_br.png"
+
+    tl = cv2.imread(str(tl_path), cv2.IMREAD_GRAYSCALE)
+    br = cv2.imread(str(br_path), cv2.IMREAD_GRAYSCALE)
+    if tl is None or br is None:
+        raise RuntimeError(
+            "Template files missing. Expected api/template_tl.png and api/template_br.png."
+        )
+    return tl, br
+
+
+TL_TEMPLATE, BR_TEMPLATE = _load_templates()
+
+
+def _find_text_centroid(img_bgr):
+    _, img_w = img_bgr.shape[:2]
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+
+    mask_cyan = cv2.inRange(hsv, np.array([80, 150, 170]), np.array([100, 255, 255]))
+    mask_yellow = cv2.inRange(hsv, np.array([18, 130, 170]), np.array([42, 255, 255]))
+    mask_white = cv2.inRange(hsv, np.array([0, 0, 180]), np.array([180, 55, 255]))
+
+    text_mask = cv2.bitwise_or(mask_cyan, cv2.bitwise_or(mask_yellow, mask_white))
+    text_mask = cv2.dilate(text_mask, np.ones((7, 30), np.uint8), iterations=3)
+
+    contours, _ = cv2.findContours(text_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best = None
+    best_area = 0
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w < 100 or h < 50:
+            continue
+        area = w * h
+        if area > best_area:
+            best_area = area
+            best = (x, y, w, h)
+
+    if not best:
+        return None
+
+    x, y, w, h = best
+    return {"cx": x + (w // 2), "cy": y + (h // 2), "rect": best}
+
+
+def _top_points(match_result, threshold=TEMPLATE_THRESHOLD, top_k=TOP_K_CANDIDATES):
+    ys, xs = np.where(match_result >= threshold)
+    if xs.size == 0:
+        flat = match_result.ravel()
+        if flat.size == 0:
+            return []
+        take = min(top_k, flat.size)
+        idx = np.argpartition(flat, -take)[-take:]
+        ys, xs = np.unravel_index(idx, match_result.shape)
+
+    points = []
+    for x, y in zip(xs.tolist(), ys.tolist()):
+        points.append((x, y, float(match_result[y, x])))
+
+    points.sort(key=lambda p: p[2], reverse=True)
+    return points[:top_k]
+
+
+def _best_point(match_result):
+    _, max_val, _, max_loc = cv2.minMaxLoc(match_result)
+    return {"x": int(max_loc[0]), "y": int(max_loc[1]), "score": float(max_val)}
+
+
+def _box_from_corners(tl_x, tl_y, br_x, br_y):
+    return {
+        "x": int(tl_x),
+        "y": int(tl_y),
+        "w": int((br_x + TEMPLATE_SIZE) - tl_x),
+        "h": int((br_y + TEMPLATE_SIZE) - tl_y),
+    }
+
+
+def _is_plausible_box(box, img_w, img_h):
+    x, y, w, h = box["x"], box["y"], box["w"], box["h"]
+    if x < 0 or y < 0:
+        return False
+    if w < 140 or h < 140:
+        return False
+    if w > int(img_w * 0.95) or h > int(img_h * 0.98):
+        return False
+    if x + w > img_w or y + h > img_h:
+        return False
+    return True
+
+
+def detect_tooltip_box(img_bgr):
+    img_h, img_w = img_bgr.shape[:2]
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    text_info = _find_text_centroid(img_bgr)
+
+    tl_map = cv2.matchTemplate(gray, TL_TEMPLATE, cv2.TM_CCOEFF_NORMED)
+    br_map = cv2.matchTemplate(gray, BR_TEMPLATE, cv2.TM_CCOEFF_NORMED)
+    best_tl = _best_point(tl_map)
+    best_br = _best_point(br_map)
+
+    primary_box = _box_from_corners(
+        best_tl["x"], best_tl["y"], best_br["x"], best_br["y"]
+    )
+    primary_ok = _is_plausible_box(primary_box, img_w, img_h)
+
+    if primary_ok and best_tl["score"] >= 0.72 and best_br["score"] >= 0.72:
+        if (best_tl["score"] + best_br["score"]) >= 1.82:
+            return primary_box, "corner-argmax"
+        if text_info:
+            cx, cy = text_info["cx"], text_info["cy"]
+            x, y, w, h = (
+                primary_box["x"],
+                primary_box["y"],
+                primary_box["w"],
+                primary_box["h"],
+            )
+            if x - 120 <= cx <= x + w + 120 and y - 120 <= cy <= y + h + 120:
+                return primary_box, "corner-argmax"
         else:
-            return jsonify({
-                "success": False,
-                "error": "Could not confidently identify the rectangular item box.",
-                "box": None
-            }), 404
-            
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+            return primary_box, "corner-argmax"
 
-if __name__ == '__main__':
+    tl_points = _top_points(tl_map)
+    br_points = _top_points(br_map)
+
+    best_box = None
+    best_score = float("-inf")
+
+    for tl_x, tl_y, tl_score in tl_points:
+        for br_x, br_y, br_score in br_points:
+            w = (br_x + TEMPLATE_SIZE) - tl_x
+            h = (br_y + TEMPLATE_SIZE) - tl_y
+
+            if not (150 <= w <= int(img_w * 0.95) and 150 <= h <= int(img_h * 0.98)):
+                continue
+            if w * h < 55000:
+                continue
+
+            score = tl_score + br_score
+            if text_info:
+                cx, cy = text_info["cx"], text_info["cy"]
+                in_x = tl_x - 60 <= cx <= tl_x + w + 60
+                in_y = tl_y - 60 <= cy <= tl_y + h + 60
+                if in_x and in_y:
+                    score += 0.25
+                else:
+                    dx = min(abs(cx - tl_x), abs(cx - (tl_x + w)))
+                    dy = min(abs(cy - tl_y), abs(cy - (tl_y + h)))
+                    score -= (dx + dy) / 3000.0
+
+            if score > best_score:
+                best_score = score
+                best_box = {"x": int(tl_x), "y": int(tl_y), "w": int(w), "h": int(h)}
+
+    if best_box and _is_plausible_box(best_box, img_w, img_h):
+        return best_box, "template-match"
+
+    if text_info:
+        x, y, w, h = text_info["rect"]
+        pad_x = 45
+        pad_y = 35
+        box = {
+            "x": max(0, x - pad_x),
+            "y": max(0, y - pad_y),
+            "w": min(img_w - max(0, x - pad_x), w + 2 * pad_x),
+            "h": min(img_h - max(0, y - pad_y), h + 2 * pad_y),
+        }
+        return box, "text-fallback"
+
+    box = {
+        "x": int(img_w * 0.65),
+        "y": int(img_h * 0.2),
+        "w": int(img_w * 0.3),
+        "h": int(img_h * 0.55),
+    }
+    return box, "default-fallback"
+
+
+def to_percent_box(pixel_box, img_w, img_h):
+    return {
+        "unit": "%",
+        "x": (float(pixel_box["x"]) / float(img_w)) * 100.0,
+        "y": (float(pixel_box["y"]) / float(img_h)) * 100.0,
+        "width": (float(pixel_box["w"]) / float(img_w)) * 100.0,
+        "height": (float(pixel_box["h"]) / float(img_h)) * 100.0,
+    }
+
+
+@app.route("/detect-box", methods=["POST"])
+@app.route("/api/detect-box", methods=["POST"])
+def detect_box():
+    if "image" not in request.files:
+        return jsonify({"success": False, "error": "No image uploaded"}), 400
+
+    file = request.files["image"]
+    file_bytes = file.read()
+    nparr = np.frombuffer(file_bytes, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if img is None:
+        return jsonify({"success": False, "error": "Invalid image format"}), 400
+
+    img_h, img_w = img.shape[:2]
+    try:
+        pixel_box, method = detect_tooltip_box(img)
+        pct_rect = to_percent_box(pixel_box, img_w, img_h)
+        return jsonify(
+            {
+                "success": True,
+                "box": pct_rect,
+                "pixel_box": pixel_box,
+                "message": f"Local CV crop success ({method})",
+            }
+        )
+    except Exception as exc:
+        return jsonify({"success": False, "error": f"Internal Error: {exc}"}), 500
+
+
+if __name__ == "__main__":
     app.run(debug=True, port=5000)
