@@ -2,7 +2,6 @@ import React, { useState, useRef, useEffect } from 'react';
 import ReactCrop from 'react-image-crop';
 import 'react-image-crop/dist/ReactCrop.css';
 import { Upload, Crop as CropIcon, Sparkles, Download, ScanSearch, X, Loader2 } from 'lucide-react';
-import { saveAs } from 'file-saver';
 
 function App() {
   const [upImg, setUpImg] = useState();
