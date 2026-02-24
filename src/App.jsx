@@ -194,18 +194,7 @@ function App() {
     }, 1500);
   };
 
-  const downloadImage = (dataUrl, filename) => {
-    // By forcing the MIME type to octet-stream internally within the data URL string right before download,
-    // the browser is forced to download the file rather than trying to open it in a new tab.
-    const octetStreamUrl = dataUrl.replace("image/png", "image/octet-stream");
-    
-    const link = document.createElement('a');
-    link.href = octetStreamUrl;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  };
+
 
   return (
     <div className="app-container">
@@ -276,13 +265,14 @@ function App() {
                       <img src={res.url} alt="Showcase result" />
                       <div><span className="badge">{res.description}</span></div>
                       {res.isReady ? (
-                        <button 
+                        <a 
                           className="btn" 
-                          style={{marginTop:'1.2rem', width: '100%', fontSize: '0.9rem', justifyContent: 'center'}} 
-                          onClick={() => downloadImage(res.url, `rf-showcase-${res.id}.png`)}
+                          style={{marginTop:'1.2rem', width: '100%', fontSize: '0.9rem', justifyContent: 'center', textDecoration: 'none', display: 'flex', gap: '0.5rem', alignItems: 'center'}} 
+                          href={res.url}
+                          download={`rf-showcase-${res.id}.png`}
                         >
                           <Download size={16} /> Save Extraction
-                        </button>
+                        </a>
                       ) : (
                         <button 
                           className="btn" 
