@@ -35,31 +35,53 @@ def detect_box():
         shape = img.shape
         img_h, img_w = int(shape[0]), int(shape[1])
         
+        candidates = []
         for cnt in contours:
             # Approximate the contour to a polygon to filter out non-rectangular noise
             epsilon = 0.02 * cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, epsilon, True)
             
-            # The target box is rectangular
-            if len(approx) == 4:
+            # The target box is roughly rectangular, but corners can add vertices
+            if len(approx) >= 4:
                 x, y, w, h = cv2.boundingRect(approx)
                 x, y, w, h = int(x), int(y), int(w), int(h)
                 area = int(w * h)
                 
-                # The user's showcase box is roughly 185,000 pixels (430x432)
+                # The user's showcase box is quite large.
                 # We filter out UI elements that are too small or the entire screen
                 max_allowed_area = int(float(img_h) * float(img_w) * 0.8)
                 if area > 50000 and area < max_allowed_area:
-                    if area > max_area:
-                        max_area = area
-                        # Calculate percentages to prevent ReactCrop shifting on responsive screens
-                        best_rect = {
-                            "unit": "%",
-                            "x": (float(x) / float(img_w)) * 100.0,
-                            "y": (float(y) / float(img_h)) * 100.0,
-                            "width": (float(w) / float(img_w)) * 100.0,
-                            "height": (float(h) / float(img_h)) * 100.0
-                        }
+                    candidates.append({"x": x, "y": y, "w": w, "h": h, "area": area})
+                    
+        # Filter out candidates that completely contain another candidate
+        # This prevents picking a large macro-UI panel instead of the inner item tooltip.
+        def contains(rect1, rect2):
+            return (rect1["x"] <= rect2["x"] and 
+                    rect1["y"] <= rect2["y"] and 
+                    rect1["x"] + rect1["w"] >= rect2["x"] + rect2["w"] and 
+                    rect1["y"] + rect1["h"] >= rect2["y"] + rect2["h"])
+                    
+        valid_candidates = []
+        for c1 in candidates:
+            is_container = False
+            for c2 in candidates:
+                if c1 != c2 and contains(c1, c2):
+                    is_container = True
+                    break
+            if not is_container:
+                valid_candidates.append(c1)
+                
+        for c in valid_candidates:
+            if c["area"] > max_area:
+                max_area = c["area"]
+                # Calculate percentages to prevent ReactCrop shifting on responsive screens
+                best_rect = {
+                    "unit": "%",
+                    "x": (float(c["x"]) / float(img_w)) * 100.0,
+                    "y": (float(c["y"]) / float(img_h)) * 100.0,
+                    "width": (float(c["w"]) / float(img_w)) * 100.0,
+                    "height": (float(c["h"]) / float(img_h)) * 100.0
+                }
         
         if best_rect:
             return jsonify({
