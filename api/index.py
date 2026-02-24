@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import cv2
 import numpy as np
+import os
 
 app = Flask(__name__)
 # Enable CORS for the React Dev Server
@@ -53,6 +54,21 @@ def detect_box():
                 if area > 50000 and area < max_allowed_area:
                     candidates.append({"x": x, "y": y, "w": w, "h": h, "area": area})
                     
+        # Try to find the [Description] text template to perfectly isolate the item box
+        desc_box = None
+        template_path = os.path.join(os.path.dirname(__file__), 'desc_template.png')
+        if os.path.exists(template_path):
+            template = cv2.imread(template_path)
+            if template is not None:
+                img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+                res = cv2.matchTemplate(img_gray, template_gray, cv2.TM_CCOEFF_NORMED)
+                loc = np.where(res >= 0.8)
+                desc_points = list(zip(*loc[::-1]))
+                if desc_points:
+                    th, tw = template_gray.shape
+                    desc_box = {"x": int(desc_points[0][0]), "y": int(desc_points[0][1]), "w": tw, "h": th}
+
         # Filter out candidates that completely contain another candidate
         # This prevents picking a large macro-UI panel instead of the inner item tooltip.
         def contains(rect1, rect2):
@@ -62,14 +78,26 @@ def detect_box():
                     rect1["y"] + rect1["h"] >= rect2["y"] + rect2["h"])
                     
         valid_candidates = []
-        for c1 in candidates:
-            is_container = False
-            for c2 in candidates:
-                if c1 != c2 and contains(c1, c2):
-                    is_container = True
-                    break
-            if not is_container:
-                valid_candidates.append(c1)
+        
+        if desc_box:
+            # If we found the [Description] text, the correct box is the one that contains it.
+            # We want the SMALLEST box that contains the description.
+            containing_candidates = [c for c in candidates if contains(c, desc_box)]
+            if containing_candidates:
+                # Add only the smallest containing box
+                smallest_container = min(containing_candidates, key=lambda c: c["area"])
+                valid_candidates.append(smallest_container)
+        
+        if not valid_candidates:
+            # Fallback to the old logic if description text wasn't found or matched no boxes
+            for c1 in candidates:
+                is_container = False
+                for c2 in candidates:
+                    if c1 != c2 and contains(c1, c2):
+                        is_container = True
+                        break
+                if not is_container:
+                    valid_candidates.append(c1)
                 
         for c in valid_candidates:
             if c["area"] > max_area:
