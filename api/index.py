@@ -8,6 +8,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 @app.route('/detect-box', methods=['POST'])
+@app.route('/api/detect-box', methods=['POST'])
 def detect_box():
     if 'image' not in request.files:
         return jsonify({"error": "No image uploaded"}), 400
