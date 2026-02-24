@@ -58,12 +58,21 @@ def detect_box():
         desc_box = None
         template_path = os.path.join(os.path.dirname(__file__), 'desc_template.png')
         if os.path.exists(template_path):
-            template = cv2.imread(template_path)
+            template = cv2.imread(template_path, cv2.IMREAD_UNCHANGED) # Load with alpha channel
             if template is not None:
                 img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
-                res = cv2.matchTemplate(img_gray, template_gray, cv2.TM_CCOEFF_NORMED)
-                loc = np.where(res >= 0.8)
+                
+                # Extract template and its mask
+                if template.shape[2] == 4: # If template has an alpha channel
+                    template_bgr = template[:,:,0:3]
+                    mask = template[:,:,3] # Alpha channel as mask
+                    template_gray = cv2.cvtColor(template_bgr, cv2.COLOR_BGR2GRAY)
+                else:
+                    template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+                    mask = None # No mask if no alpha channel
+                
+                res = cv2.matchTemplate(img_gray, template_gray, cv2.TM_CCORR_NORMED, mask=mask)
+                loc = np.where(res >= 0.5)
                 desc_points = list(zip(*loc[::-1]))
                 if desc_points:
                     th, tw = template_gray.shape
@@ -84,12 +93,25 @@ def detect_box():
             # We want the SMALLEST box that contains the description.
             containing_candidates = [c for c in candidates if contains(c, desc_box)]
             if containing_candidates:
-                # Add only the smallest containing box
                 smallest_container = min(containing_candidates, key=lambda c: c["area"])
                 valid_candidates.append(smallest_container)
+            else:
+                # If OpenCV contours completely missed the border (due to semi-transparent UI blending into snow)
+                # We use a robust heuristic fallback anchor crop around the desc_box!
+                # It covers typical item tooltips comfortably without grabbing the entire screen.
+                heuristic_x = max(0, desc_box["x"] - 140)
+                heuristic_y = max(0, desc_box["y"] - 340)
+                heuristic_w = 420
+                heuristic_h = 480
+                heuristic_x = min(heuristic_x, img_w - heuristic_w)
+                heuristic_y = min(heuristic_y, img_h - heuristic_h)
+                
+                valid_candidates.append({
+                    "x": heuristic_x, "y": heuristic_y, "w": heuristic_w, "h": heuristic_h, "area": heuristic_w*heuristic_h
+                })
         
         if not valid_candidates:
-            # Fallback to the old logic if description text wasn't found or matched no boxes
+            # Complete fallback to the old logic if description text wasn't found at all
             for c1 in candidates:
                 is_container = False
                 for c2 in candidates:
